@@ -5,19 +5,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers import DiffusionPipeline, StableDiffusion3Pipeline
 from torch.nn import Module
 
-
 class UnifiedDiffusionPipeline:
     def __init__(self, model_dir, device, image_height, image_width,
                  scheduler=None, seed=None, guidance_scale=7.5,
                  denoising_steps=20, num_images_per_prompt=1,
                  output_dir="output", lora=None, adapter_weights=None,
                  lora_scale=1.0, merge_lora=False, model_type="sdxl"):
-        """
-        统一的 Diffusion Pipeline 类，支持 SDXL 和 SD3。
-
-        参数:
-            model_type (str): 模型类型，"sdxl" 或 "sd3"
-        """
         self.model_dir = model_dir
         self.device = device
         self.image_height = image_height
@@ -31,7 +24,7 @@ class UnifiedDiffusionPipeline:
         self.lora = lora or []
         self.adapter_weights = adapter_weights or []
         self.lora_scale = lora_scale
-        self.merge_lora_flag = merge_lora
+        self.merge_lora = merge_lora
         self.model_type = model_type
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -40,17 +33,17 @@ class UnifiedDiffusionPipeline:
     def _load_model(self):
         dtype = torch.float16 if self.device in ["cuda", "gcu"] else torch.float32
 
-        if self.model_type == "sdxl":
-            pipe = DiffusionPipeline.from_pretrained(self.model_dir, torch_dtype=dtype)
-            pipe.unet.to(memory_format=torch.channels_last)
-            pipe.vae.to(memory_format=torch.channels_last)
-        elif self.model_type == "sd3":
-            pipe = StableDiffusion3Pipeline.from_pretrained(self.model_dir, torch_dtype=dtype)
-        else:
-            raise ValueError(f"Unsupported model_type: {self.model_type}")
-
-        pipe = pipe.to(self.device)
-        return pipe
+        match self.model_type:
+            case "sdxl":
+                pipe = DiffusionPipeline.from_pretrained(self.model_dir, torch_dtype=dtype)
+                pipe.unet.to(memory_format=torch.channels_last)
+                pipe.vae.to(memory_format=torch.channels_last)
+            case "sd3":
+                pipe = StableDiffusion3Pipeline.from_pretrained(self.model_dir, torch_dtype=dtype)
+            case _:
+                raise ValueError(f"Unsupported model_type: {self.model_type}")
+        
+        return pipe.to(self.device)
 
     def _set_scheduler(self):
         if self.model_type == "sdxl":
@@ -89,44 +82,36 @@ class UnifiedDiffusionPipeline:
 
     def run(self, prompt, prompt_2=None, prompt_3=None,
             negative_prompt=None, negative_prompt_2=None, negative_prompt_3=None):
-        """
-        执行图像生成任务。
-
-        支持根据模型类型自动适配参数。
-        """
         self.prompt = prompt
         self._set_scheduler()
 
-        # 准备提示词
-        prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3 = self._prepare_prompts(
-            prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3
-        )
-
-        # 生成 latent
         latents = self._generate_latents()
 
-        # 构造参数
-        common_kwargs = {
+        self.args = {
             "prompt": prompt,
             "height": self.image_height,
             "width": self.image_width,
             "num_images_per_prompt": self.num_images_per_prompt,
             "num_inference_steps": self.denoising_steps,
             "guidance_scale": self.guidance_scale,
-            "latents": latents
+            "latents": latents,
+            "output_dir": self.output_dir
         }
 
-        # 根据模型类型添加不同参数
+        prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3 = self._prepare_prompts(
+            prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3
+        )
+
         if self.model_type == "sdxl":
-            cross_attention_kwargs = {"scale": self.lora_scale} if len(self.lora) > 0 and not self.merge_lora_flag else None
-            common_kwargs.update({
+            cross_attention_kwargs = {"scale": self.lora_scale} if len(self.lora) > 0 and not self.merge_lora else None
+            self.args.update({
                 "prompt_2": prompt_2,
                 "negative_prompt": negative_prompt,
                 "negative_prompt_2": negative_prompt_2,
                 "cross_attention_kwargs": cross_attention_kwargs
             })
         elif self.model_type == "sd3":
-            common_kwargs.update({
+            self.args.update({
                 "prompt_2": prompt_2,
                 "prompt_3": prompt_3,
                 "negative_prompt": negative_prompt,
@@ -134,10 +119,8 @@ class UnifiedDiffusionPipeline:
                 "negative_prompt_3": negative_prompt_3
             })
 
-        # 执行推理
-        images = self.pipe(**common_kwargs).images
+        images = self.pipe(**self.args).images
 
-        # 保存图像
         self._save_images(images, prompt, seed=self.seed if self.seed else 42)
 
     def _save_images(self, images, prompt_list, seed):
@@ -152,7 +135,6 @@ class UnifiedDiffusionPipeline:
                 print(f'saving current picture costs time: {t_save_end - t_save_start}')
 
 
-# ================== 测试用例 ==================
 if __name__ == "__main__":
     print("=== 测试 SDXL ===")
     sdxl_pipeline = UnifiedDiffusionPipeline(
