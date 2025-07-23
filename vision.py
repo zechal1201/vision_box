@@ -2,8 +2,8 @@ import os
 import time
 import torch
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers import DiffusionPipeline, StableDiffusion3Pipeline
-from torch.nn import Module
+from diffusers_utils.examples.common.utils import LoraUtils
+from diffusers_utils.examples.common.get_scheduler import get_scheduler
 
 class UnifiedDiffusionPipeline:
     def __init__(self, model_dir, device, image_height, image_width,
@@ -15,7 +15,7 @@ class UnifiedDiffusionPipeline:
         self.device = device
         self.image_height = image_height
         self.image_width = image_width
-        self.scheduler_name = scheduler
+        self.scheduler = scheduler
         self.seed = seed
         self.guidance_scale = guidance_scale
         self.denoising_steps = denoising_steps
@@ -26,29 +26,27 @@ class UnifiedDiffusionPipeline:
         self.lora_scale = lora_scale
         self.merge_lora = merge_lora
         self.model_type = model_type
-
         os.makedirs(self.output_dir, exist_ok=True)
         self.pipe = self._load_model()
 
     def _load_model(self):
         dtype = torch.float16 if self.device in ["cuda", "gcu"] else torch.float32
-
         match self.model_type:
             case "sdxl":
+                from diffusers import DiffusionPipeline
                 pipe = DiffusionPipeline.from_pretrained(self.model_dir, torch_dtype=dtype)
                 pipe.unet.to(memory_format=torch.channels_last)
                 pipe.vae.to(memory_format=torch.channels_last)
             case "sd3":
+                from diffusers import StableDiffusion3Pipeline
                 pipe = StableDiffusion3Pipeline.from_pretrained(self.model_dir, torch_dtype=dtype)
             case _:
                 raise ValueError(f"Unsupported model_type: {self.model_type}")
-        
         return pipe.to(self.device)
 
     def _set_scheduler(self):
-        if self.model_type == "sdxl":
-            from diffusers import DDIMScheduler
-            self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        config_path = os.path.join(self.model_dir, "scheduler")
+        self.pipe.scheduler = get_scheduler(self.scheduler, config_path)
 
     def _prepare_prompts(self, prompt, prompt_2=None, prompt_3=None,
                          negative_prompt=None, negative_prompt_2=None, negative_prompt_3=None):
@@ -67,61 +65,40 @@ class UnifiedDiffusionPipeline:
 
         return prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3
 
-    def _generate_latents(self):
+    def _generate_latents(self, prompt):
         seed = self.seed if self.seed is not None else 42
         generator = torch.Generator(device='cpu').manual_seed(seed)
-
         vae_scale_factor = self.pipe.vae_scale_factor
         num_channels_latents = 4 if self.model_type == "sdxl" else self.pipe.transformer.config.in_channels
-        shape = (self.num_images_per_prompt * len(self.prompt), num_channels_latents,
+        shape = (self.num_images_per_prompt * len(prompt), num_channels_latents,
                  self.image_height // vae_scale_factor, self.image_width // vae_scale_factor)
         latents = randn_tensor(shape, generator=generator, device=torch.device('cpu'), dtype=torch.float16)
         if self.device == 'cpu':
             latents = latents.to(torch.float32)
         return latents
 
-    def run(self, prompt, prompt_2=None, prompt_3=None,
-            negative_prompt=None, negative_prompt_2=None, negative_prompt_3=None):
-        self.prompt = prompt
-        self._set_scheduler()
+    def _set_lora(self):
+        if(len(self.lora) > 0):
+            lora_util = LoraUtils(self.pipe)
+            adapter_name_list = lora_util.load_lora(self.lora)
+            lora_util.set_active_adapters(adapter_name_list, self.adapter_weights)
+            return lora_util.merge_lora_weights(self.merge_lora, self.lora_scale)
+        return False
 
-        latents = self._generate_latents()
-
-        self.args = {
-            "prompt": prompt,
-            "height": self.image_height,
-            "width": self.image_width,
-            "num_images_per_prompt": self.num_images_per_prompt,
-            "num_inference_steps": self.denoising_steps,
-            "guidance_scale": self.guidance_scale,
-            "latents": latents,
-            "output_dir": self.output_dir
-        }
-
-        prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3 = self._prepare_prompts(
-            prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3
-        )
-
-        if self.model_type == "sdxl":
-            cross_attention_kwargs = {"scale": self.lora_scale} if len(self.lora) > 0 and not self.merge_lora else None
-            self.args.update({
-                "prompt_2": prompt_2,
-                "negative_prompt": negative_prompt,
-                "negative_prompt_2": negative_prompt_2,
-                "cross_attention_kwargs": cross_attention_kwargs
-            })
-        elif self.model_type == "sd3":
-            self.args.update({
-                "prompt_2": prompt_2,
-                "prompt_3": prompt_3,
-                "negative_prompt": negative_prompt,
-                "negative_prompt_2": negative_prompt_2,
-                "negative_prompt_3": negative_prompt_3
-            })
-
-        images = self.pipe(**self.args).images
-
-        self._save_images(images, prompt, seed=self.seed if self.seed else 42)
+    def _prepare_prompt_args(self, arguments, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3):
+        cross_attention_kwargs = {}
+        if (self._set_lora()): 
+            cross_attention_kwargs={"scale": self.lora_scale}
+        arguments.prompt_2 = prompt_2
+        arguments.negative_prompt = negative_prompt
+        arguments.negative_prompt_2 = negative_prompt_2
+        match self.model_type:
+            case "sdxl":
+                arguments.update({"cross_attention_kwargs": cross_attention_kwargs})
+            case "sd3":
+                arguments.update({"prompt_3": prompt_3, "negative_prompt_3": negative_prompt_3})
+            case _:
+                raise ValueError(f"Unsupported model_type: {self.model_type}")
 
     def _save_images(self, images, prompt_list, seed):
         for i, prompt in enumerate(prompt_list):
@@ -130,11 +107,32 @@ class UnifiedDiffusionPipeline:
                 image = images[i * self.num_images_per_prompt + j]
                 img_name = f"{seed}-prompt_{i}-img_{j}-steps_{self.denoising_steps}-cfg_{self.guidance_scale}-{prompt_str}.png"
                 t_save_start = time.time()
-                print(f"Saving {img_name}... (模拟保存)")
+                image.save(os.path.join(self.args.output_dir, img_name))
                 t_save_end = time.time()
                 print(f'saving current picture costs time: {t_save_end - t_save_start}')
 
+    def run(self, prompt, prompt_2=None, prompt_3=None,
+            negative_prompt=None, negative_prompt_2=None, negative_prompt_3=None):
+        arguments = {
+            "prompt": prompt,
+            "height": self.image_height,
+            "width": self.image_width,
+            "num_images_per_prompt": self.num_images_per_prompt,
+            "num_inference_steps": self.denoising_steps,
+            "guidance_scale": self.guidance_scale,
+            "output_dir": self.output_dir
+        }
+        self._set_scheduler()
+        arguments["latents"] = self._generate_latents(prompt)
+        prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3 = self._prepare_prompts(
+            prompt, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3)
+        self._prepare_prompt_args(arguments, prompt_2, prompt_3, negative_prompt, negative_prompt_2, negative_prompt_3)
 
+        images = self.pipe(**arguments).images
+        self._save_images(images, prompt, seed=self.seed if self.seed else 42)
+
+
+# ================== 测试用例 ==================
 if __name__ == "__main__":
     print("=== 测试 SDXL ===")
     sdxl_pipeline = UnifiedDiffusionPipeline(
@@ -158,7 +156,6 @@ if __name__ == "__main__":
         negative_prompt=["low quality, blurry"],
         negative_prompt_2=[""]
     )
-
     print("\n=== 测试 SD3 ===")
     sd3_pipeline = UnifiedDiffusionPipeline(
         model_dir="stabilityai/stable-diffusion-3-medium",
